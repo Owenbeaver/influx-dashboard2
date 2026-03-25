@@ -384,7 +384,7 @@ if not st.session_state.authenticated:
 
     _, _lmid, _ = st.columns([1.5, 1, 1.5])
     with _lmid:
-        with st.form("login_form", clear_on_submit=True):
+        with st.form("login_form"):
             _pw = st.text_input("", type="password", placeholder="Password",
                                 label_visibility="collapsed")
             _submitted = st.form_submit_button(
