@@ -40,6 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
 APIFY_TOKEN  = os.environ.get("APIFY_TOKEN",  "")
 SERPAPI_KEY  = os.environ.get("SERPAPI_KEY",  "")
 APOLLO_KEY   = os.environ.get("APOLLO_KEY",   "")
+HUNTER_KEY   = os.environ.get("HUNTER_KEY",   "")
 
 # Permanent webhook server URL (deployed on Railway).
 # If set, the pipeline POSTs Apollo phone-reveal callbacks here and polls
@@ -183,6 +184,46 @@ def scrape_website(url: str) -> str:
         if text:
             chunks.append(text[:2000])
     return "\n\n---\n\n".join(chunks)
+
+
+# ------------------------------------------------------------------------------
+# Step 3b - Website email scrape (contact/about pages, zero API credits)
+# ------------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b")
+_EMAIL_SKIP_TERMS = ("noreply", "no-reply", "@example", "test@", "@sentry", "@sampleemail")
+
+
+def scrape_domain_for_email(domain: str) -> str:
+    """
+    Crawl /contact, /about, /contact-us on the domain in one Apify run.
+    Returns the first real email address found, or ''.
+    """
+    if not domain:
+        return ""
+    print(f"  [WebEmail] Scraping contact/about pages for {domain}...")
+    results = apify_run_and_wait(
+        "apify~website-content-crawler",
+        {
+            "startUrls": [
+                {"url": f"https://{domain}/contact"},
+                {"url": f"https://{domain}/about"},
+                {"url": f"https://{domain}/contact-us"},
+            ],
+            "maxCrawlPages": 3,
+            "maxCrawlDepth": 0,
+            "crawlerType": "cheerio",
+        },
+        max_wait=120,
+    )
+    for page in results:
+        text = page.get("text", "") or page.get("markdown", "") or ""
+        for email in _EMAIL_RE.findall(text):
+            if not any(skip in email.lower() for skip in _EMAIL_SKIP_TERMS):
+                print(f"    [WebEmail] Found: {email} on {page.get('url', '?')}")
+                return email
+    print("    [WebEmail] No email found on contact/about pages")
+    return ""
 
 
 # ------------------------------------------------------------------------------
@@ -583,6 +624,94 @@ def find_and_select_linkedin(ig_username: str, full_name: str, niche: str,
 
 
 # ------------------------------------------------------------------------------
+# Step 5b - Unverified LinkedIn search (low-confidence / single-name accounts)
+# ------------------------------------------------------------------------------
+
+def find_linkedin_unverified(ig_username: str, first_name: str, niche: str,
+                              bio: str, website: str = "") -> tuple[str, list]:
+    """
+    Lightweight LinkedIn search for accounts where Claude couldn't extract a
+    reliable full name.  Runs up to 4 targeted queries in order and takes the
+    first result, flagging it as [UNVERIFIED].
+
+    Returns ("[UNVERIFIED] url", deduplicated_candidate_list) or ("", []).
+    """
+    print(f"  [LinkedIn-Unverified] Searching for @{ig_username} ({first_name!r})...")
+
+    domain = _extract_root_domain(website)
+    if not domain and website:
+        real_url = _follow_redirect(website)
+        if real_url != website:
+            domain = _extract_root_domain(real_url)
+
+    bio_mentions = re.findall(r"@(\w+)", bio)  # brand @mentions in bio
+
+    seen: set = set()
+    all_hits: list = []  # (url, title) ordered by discovery
+
+    def _try(query: str):
+        hits = _serp_candidates(query, 3)
+        print(f"    [Search] {query!r} → {len(hits)} hit(s)")
+        for url, title in hits:
+            if url not in seen:
+                seen.add(url)
+                all_hits.append((url, title))
+
+    # 1. Username + niche
+    _try(f"{ig_username} {niche} linkedin")
+    # 2. First name + niche
+    _try(f"{first_name} {niche} linkedin")
+    # 3. Brand @mentions from bio
+    for mention in bio_mentions[:2]:
+        if mention.lower() != ig_username.lower():
+            _try(f"{mention} {niche} linkedin")
+            time.sleep(0.3)
+    # 4. Website domain
+    if domain:
+        _try(f"{domain} linkedin")
+
+    if not all_hits:
+        print("    [Unverified] No candidates found")
+        return "", []
+
+    best_url = all_hits[0][0]
+    all_candidate_urls = [u for u, _ in all_hits]
+    print(f"    [Unverified] Taking first result: {best_url}")
+    return f"[UNVERIFIED] {best_url}", all_candidate_urls
+
+
+# ------------------------------------------------------------------------------
+# Step 6b - Hunter.io: email from website domain
+# ------------------------------------------------------------------------------
+
+def get_hunter_email(domain: str) -> str:
+    """Search Hunter.io Domain Search for the best email on the given domain."""
+    if not domain or not HUNTER_KEY:
+        return ""
+    print(f"  [Hunter] Searching domain: {domain}")
+    try:
+        resp = requests.get(
+            "https://api.hunter.io/v2/domain-search",
+            params={"domain": domain, "api_key": HUNTER_KEY},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"    [Hunter] {resp.status_code}: {resp.text[:200]}")
+            return ""
+        emails = resp.json().get("data", {}).get("emails", [])
+        if not emails:
+            print("    [Hunter] No emails found")
+            return ""
+        best = max(emails, key=lambda e: e.get("confidence", 0))
+        email = best.get("value", "")
+        print(f"    [Hunter] Found: {email} (confidence={best.get('confidence')})")
+        return email
+    except Exception as e:
+        print(f"    [Hunter] Error: {e}")
+        return ""
+
+
+# ------------------------------------------------------------------------------
 # Step 7 - Apollo.io: get email + phone
 # ------------------------------------------------------------------------------
 
@@ -669,17 +798,17 @@ def _poll_webhook_site(check_url: str, timeout: int = 240) -> str:
     return ""
 
 
-def get_apollo_contact(linkedin_url: str, full_name: str = "") -> dict:
+def get_apollo_contact(linkedin_url: str, full_name: str = "", phone_only: bool = False) -> dict:
     """
     Return {email, phone} from Apollo.io.
 
-    Step 1 — email:  POST /v1/people/match   (synchronous)
+    Step 1 — email:  POST /v1/people/match   (synchronous) — skipped if phone_only=True
     Step 2 — phone:  POST /v1/people/enrich  (async webhook reveal)
       • If WEBHOOK_URL is set → use permanent Railway server
       • Otherwise             → use a per-request webhook.site token
     """
     linkedin_url = _normalize_li_url(linkedin_url)
-    print(f"  [Apollo] Looking up: {linkedin_url}")
+    print(f"  [Apollo] Looking up: {linkedin_url}{' (phone only)' if phone_only else ''}")
 
     h = {
         "Content-Type": "application/json",
@@ -690,23 +819,24 @@ def get_apollo_contact(linkedin_url: str, full_name: str = "") -> dict:
     # ── Step 1: email ─────────────────────────────────────────────────────────
     email     = ""
     person_id = ""
-    resp = requests.post(
-        "https://api.apollo.io/v1/people/match",
-        headers=h,
-        json={"linkedin_url": linkedin_url, "reveal_personal_emails": True},
-        timeout=30,
-    )
-    if resp.status_code in (200, 201):
-        person    = resp.json().get("person") or {}
-        person_id = person.get("id", "")
-        email     = person.get("email", "")
-        if not email:
-            personal = person.get("personal_emails") or []
-            email = personal[0] if personal else ""
-    else:
-        print(f"    X Apollo match {resp.status_code}: {resp.text[:200]}")
+    if not phone_only:
+        resp = requests.post(
+            "https://api.apollo.io/v1/people/match",
+            headers=h,
+            json={"linkedin_url": linkedin_url, "reveal_personal_emails": True},
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            person    = resp.json().get("person") or {}
+            person_id = person.get("id", "")
+            email     = person.get("email", "")
+            if not email:
+                personal = person.get("personal_emails") or []
+                email = personal[0] if personal else ""
+        else:
+            print(f"    X Apollo match {resp.status_code}: {resp.text[:200]}")
 
-    print(f"    [Apollo] email={email or '-'}")
+        print(f"    [Apollo] email={email or '-'}")
 
     # ── Step 2: phone via enrich + webhook reveal ─────────────────────────────
     phone = ""
@@ -773,6 +903,7 @@ def process_handle(handle: str) -> dict:
         "linkedin_candidates":  "",
         "needs_review":         "",
         "email":                "",
+        "email_source":         "",
         "phone":                "",
         "error":                "",
     }
@@ -812,27 +943,78 @@ def process_handle(handle: str) -> dict:
         result["full_name"] = full_name
         result["niche"]     = niche
 
-        # -- 4+5. Find + select LinkedIn (search + verify in one pass) ----
-        ig_username  = profile["username"]
-        linkedin_url, tied_urls = find_and_select_linkedin(
-            ig_username, full_name, niche, bio,
-            website=website,
-        )
+        # -- Confidence flag: single-word name or low confidence → search harder --
+        name_parts_check = full_name.strip().split()
+        is_uncertain     = confidence == "low" or len(name_parts_check) < 2
 
-        if not linkedin_url:
-            print("    X No confirmed LinkedIn URL found")
-            result["error"] = "LinkedIn URL not found"
-            return result
+        # -- 4+5. LinkedIn -----------------------------------------------
+        ig_username = profile["username"]
+        all_linkedin_candidates: list = []
 
-        result["linkedin_url"] = linkedin_url
-        if tied_urls:
-            result["linkedin_candidates"] = " | ".join(tied_urls)
+        if is_uncertain:
+            reason = "single-word name" if len(name_parts_check) < 2 else "low confidence"
+            print(f"    ~ Uncertain name ({reason}) — using unverified LinkedIn search")
+            first_name = name_parts_check[0] if name_parts_check else full_name
+            linkedin_url, all_linkedin_candidates = find_linkedin_unverified(
+                ig_username, first_name, niche, bio, website=website,
+            )
+            if not linkedin_url:
+                print("    X No LinkedIn candidates found via unverified search")
+                result["error"]        = "LinkedIn URL not found"
+                result["needs_review"] = "TRUE"
+                result["email_source"] = "manual_needed"
+                result["phone"]        = "Manual lookup needed | No LinkedIn candidates found"
+                return result
+            result["linkedin_url"]        = linkedin_url
+            result["linkedin_candidates"] = " | ".join(all_linkedin_candidates[:5])
             result["needs_review"]        = "TRUE"
+        else:
+            linkedin_url, tied_urls = find_and_select_linkedin(
+                ig_username, full_name, niche, bio, website=website,
+            )
+            if not linkedin_url:
+                print("    X No confirmed LinkedIn URL found")
+                result["error"] = "LinkedIn URL not found"
+                return result
+            result["linkedin_url"] = linkedin_url
+            if tied_urls:
+                result["linkedin_candidates"] = " | ".join(tied_urls)
+                result["needs_review"]        = "TRUE"
+                all_linkedin_candidates       = tied_urls
 
-        # -- 6. Apollo: email + phone ----------------------------------
-        contact         = get_apollo_contact(linkedin_url, full_name=full_name)
-        result["email"] = contact["email"]
-        result["phone"] = contact["phone"]
+        # Strip [UNVERIFIED] prefix before passing to Apollo
+        apollo_url = linkedin_url[len("[UNVERIFIED] "):] if linkedin_url.startswith("[UNVERIFIED] ") else linkedin_url
+
+        # -- 6. Email: website scrape → Hunter → Apollo ------------------
+        email        = ""
+        email_source = ""
+        ig_domain    = _extract_root_domain(website)
+
+        if ig_domain:
+            email = scrape_domain_for_email(ig_domain)
+            if email:
+                email_source = "website_scrape"
+
+        if not email and ig_domain:
+            email = get_hunter_email(ig_domain)
+            if email:
+                email_source = "hunter"
+
+        # -- 7. Apollo: phone (+ email if not already found) ------------
+        contact = get_apollo_contact(apollo_url, full_name=full_name,
+                                     phone_only=bool(email))
+        if not email and contact["email"]:
+            email        = contact["email"]
+            email_source = "apollo"
+
+        result["email"]        = email
+        result["email_source"] = email_source or "manual_needed"
+        result["phone"]        = contact["phone"]
+
+        # -- Change 3: helpful phone message when manual review needed ---
+        if result["needs_review"] == "TRUE" and not result["phone"]:
+            candidates_str = result["linkedin_candidates"] or result["linkedin_url"]
+            result["phone"] = f"Manual lookup needed | Candidates: {candidates_str}"
 
     except Exception as exc:
         result["error"] = str(exc)
@@ -850,7 +1032,7 @@ def _retry_phone_reveals(results: list) -> bool:
     After the main loop, retry phone reveals for any row that has an email
     but no phone.  Returns True if any phones were recovered.
     """
-    fieldnames = ["handle", "full_name", "niche", "linkedin_url", "linkedin_candidates", "needs_review", "email", "phone", "error"]
+    fieldnames = ["handle", "full_name", "niche", "linkedin_url", "linkedin_candidates", "needs_review", "email", "email_source", "phone", "error"]
     need_retry = [
         r for r in results
         if r.get("email") and not r.get("phone") and r.get("linkedin_url")
@@ -939,7 +1121,7 @@ def main():
             delay_between = True
             print(f"FULL MODE -- processing all {len(handles)} handles\n")
 
-    fieldnames = ["handle", "full_name", "niche", "linkedin_url", "linkedin_candidates", "needs_review", "email", "phone", "error"]
+    fieldnames = ["handle", "full_name", "niche", "linkedin_url", "linkedin_candidates", "needs_review", "email", "email_source", "phone", "error"]
     results = []
 
     # Open CSV at start and flush each row immediately so the dashboard can
